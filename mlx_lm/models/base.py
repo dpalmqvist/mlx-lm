@@ -76,14 +76,25 @@ def quantized_scaled_dot_product_attention(
 
     # Fast path: when the underlying mlx build exposes a fused quantized
     # vector-SDPA kernel (added in mlx 0.32+), use it for decode-shape calls
-    # that fall inside its supported envelope. The fused kernel streams packed
-    # K/V directly into attention without materializing fp16 dequant outputs,
-    # which is bandwidth-bound at long context.
+    # that fall inside its supported envelope.
+    #
+    # The kernel is only dispatched when n_repeats >= 5 (high-GQA shapes such
+    # as Qwen-style Hq/Hk = 28/4). At n_repeats <= 4 (Llama-style and
+    # Qwen3-8B Hq/Hk = 32/8) the existing two-quantized_matmul decomposition
+    # is faster end-to-end on M4-class hardware, despite the fused kernel
+    # winning over its own dequantize+SDPA fallback at the isolated-kernel
+    # level. Measured on Qwen3-8B-4bit (n_repeats=4) at ctx=15018:
+    # fused 24.0 tok/s vs decomp 38.3 tok/s.
+    #
+    # At n_repeats >= 5, mlx core's QuantizedScaledDotProductAttention
+    # primitive internally routes to mx.dequantize + fast.SDPA, which is
+    # the documented win on high-GQA shapes.
     if (
         L == 1
         and bits == 4
         and group_size in (32, 64, 128)
         and D in (64, 128, 256)
+        and n_repeats >= 5
         and (mask is None or isinstance(mask, str))
         and hasattr(mx.fast, "quantized_scaled_dot_product_attention")
     ):

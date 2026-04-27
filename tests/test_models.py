@@ -303,50 +303,54 @@ class TestModels(unittest.TestCase):
         mx.eval(x)
         self.assertTrue((x == 1).all())
 
-    def test_quantized_sdpa_bits4_decode_fast_path(self):
-        # bits=4 + L=1 + supported head_dim/group_size routes through the
-        # fused mx.fast.quantized_scaled_dot_product_attention kernel when
-        # the underlying mlx exposes it. Compare the cache helper's output
-        # to a manual dequantize+SDPA reference.
+    def test_quantized_sdpa_bits4_decode(self):
+        # bits=4 + L=1 + supported head_dim/group_size has two backends:
+        #   n_repeats >= 5: fused mx.fast.quantized_scaled_dot_product_attention
+        #   n_repeats <= 4: two-mx.quantized_matmul decomposition
+        # Both should match a dequantize+SDPA reference within tolerance.
         if not hasattr(mx.fast, "quantized_scaled_dot_product_attention"):
             self.skipTest(
                 "mlx build does not expose fast.quantized_scaled_dot_product_attention"
             )
         from mlx_lm.models.base import quantized_scaled_dot_product_attention
 
-        for D, gs in [(64, 32), (128, 64), (128, 128), (256, 64)]:
-            cache = KVCache()
-            mx.random.seed(0)
-            k = 1e-1 * mx.random.normal((1, 2, 1024, D))
-            v = 1e-1 * mx.random.normal((1, 2, 1024, D))
-            cache.update_and_fetch(k, v)
-            quant = cache.to_quantized(group_size=gs, bits=4)
+        # n_kv_heads=2 across cases; vary n_q_heads to hit both branches.
+        # n_repeats=4 -> decomp branch, n_repeats=8 -> fused branch.
+        for n_q_heads, branch in [(8, "decomp"), (16, "fused")]:
+            for D, gs in [(64, 32), (128, 64), (128, 128), (256, 64)]:
+                cache = KVCache()
+                mx.random.seed(0)
+                k = 1e-1 * mx.random.normal((1, 2, 1024, D))
+                v = 1e-1 * mx.random.normal((1, 2, 1024, D))
+                cache.update_and_fetch(k, v)
+                quant = cache.to_quantized(group_size=gs, bits=4)
 
-            k1 = 1e-1 * mx.random.normal((1, 2, 1, D))
-            v1 = 1e-1 * mx.random.normal((1, 2, 1, D))
-            qk_full, qv_full = quant.update_and_fetch(k1, v1)
+                k1 = 1e-1 * mx.random.normal((1, 2, 1, D))
+                v1 = 1e-1 * mx.random.normal((1, 2, 1, D))
+                qk_full, qv_full = quant.update_and_fetch(k1, v1)
 
-            q = 1e-1 * mx.random.normal((1, 8, 1, D))
-            scale = 1.0 / (D**0.5)
+                q = 1e-1 * mx.random.normal((1, n_q_heads, 1, D))
+                scale = 1.0 / (D**0.5)
 
-            out = quantized_scaled_dot_product_attention(
-                q,
-                qk_full,
-                qv_full,
-                scale=scale,
-                mask=None,
-                group_size=gs,
-                bits=4,
-            )
+                out = quantized_scaled_dot_product_attention(
+                    q,
+                    qk_full,
+                    qv_full,
+                    scale=scale,
+                    mask=None,
+                    group_size=gs,
+                    bits=4,
+                )
 
-            k_dq = mx.dequantize(*qk_full, group_size=gs, bits=4).astype(q.dtype)
-            v_dq = mx.dequantize(*qv_full, group_size=gs, bits=4).astype(q.dtype)
-            ref = mx.fast.scaled_dot_product_attention(q, k_dq, v_dq, scale=scale)
-            self.assertTrue(
-                mx.allclose(out, ref, atol=5e-3, rtol=5e-3),
-                f"bits=4 fast path differs from dequantize+SDPA "
-                f"(D={D}, gs={gs}, max-err={float(mx.max(mx.abs(out - ref)))})",
-            )
+                k_dq = mx.dequantize(*qk_full, group_size=gs, bits=4).astype(q.dtype)
+                v_dq = mx.dequantize(*qv_full, group_size=gs, bits=4).astype(q.dtype)
+                ref = mx.fast.scaled_dot_product_attention(q, k_dq, v_dq, scale=scale)
+                self.assertTrue(
+                    mx.allclose(out, ref, atol=5e-3, rtol=5e-3),
+                    f"bits=4 {branch} branch differs from dequantize+SDPA "
+                    f"(n_q_heads={n_q_heads}, D={D}, gs={gs}, "
+                    f"max-err={float(mx.max(mx.abs(out - ref)))})",
+                )
 
     def test_quantized_sdpa(self):
         cache = KVCache()
