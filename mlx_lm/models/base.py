@@ -74,7 +74,35 @@ def quantized_scaled_dot_product_attention(
     n_kv_heads = q_keys[0].shape[-3]
     n_repeats = n_q_heads // n_kv_heads
 
-    queries *= scale
+    # Fast path: when the underlying mlx build exposes a fused quantized
+    # vector-SDPA kernel (added in mlx 0.32+), use it for decode-shape calls
+    # that fall inside its supported envelope. The fused kernel streams packed
+    # K/V directly into attention without materializing fp16 dequant outputs,
+    # which is bandwidth-bound at long context.
+    if (
+        L == 1
+        and bits == 4
+        and group_size in (32, 64, 128)
+        and D in (64, 128, 256)
+        and (mask is None or isinstance(mask, str))
+        and hasattr(mx.fast, "quantized_scaled_dot_product_attention")
+    ):
+        mask_arg = mask  # None or "causal"
+        return mx.fast.quantized_scaled_dot_product_attention(
+            queries,
+            q_keys[0],
+            q_keys[1],
+            q_keys[2],
+            q_values[0],
+            q_values[1],
+            q_values[2],
+            scale=scale,
+            group_size=group_size,
+            bits=bits,
+            mask=mask_arg,
+        )
+
+    queries = queries * scale
 
     if n_repeats > 1:
         queries = mx.reshape(queries, (B, n_kv_heads, n_repeats, L, D))
